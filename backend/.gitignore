@@ -29,3 +29,6 @@ uploads/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# macOS 文件夹 元数据文件
+.DS_Store
