@@ -445,3 +445,177 @@ summary_service 说"开工！"
 | 执行层 | `nodes/*.py` + 4 个 Agent | 真正干活，写便利贴 |
 | 记账层 | `agent_run_service.py` | 全程往 Run 单上记 |
 | 监控层 | `agent_runs.py` (本文档主角) | 暴露 HTTP 接口给前端看 Run 单 |
+
+---
+
+## 🛡️ 九、Harness `harness_wrap()` 完整流程图
+
+> 文件位置：`backend/app/agents/harness/`
+>
+> 一句话定位：**给每个 Agent 节点套上一层「工业级外壳」**——把"记账 / 熔断 / 超时 / 重试 / 校验 / 预算同步"这些脏活累活全干了，Agent 自己只管写业务。
+
+### 9.1 五大组件是啥
+
+| 组件 | 文件 | 一句话作用 | 通俗理解 |
+|---|---|---|---|
+| **BudgetGuard** | `budget.py` | Token / 成本双闸门 | 「还剩多少钱，超了就停」的账房先生 |
+| **CircuitBreaker** | `circuit_breaker.py` | 三态熔断器（CLOSED/OPEN/HALF_OPEN） | 「下游挂了就先别打了，等一会再试探」的保险丝 |
+| **with_smart_retry** | `retry.py` | 错误分类 + 指数退避 + 抖动 | 「网络抖动重试，密码错误不重试」的智能重试 |
+| **OutputValidator** | `validator.py` | Pydantic 结构校验 | 「Agent 交作业，先检查格式对不对」的批改老师 |
+| **harness_wrap** | `wrap.py` | 装饰器，把上面 4 个粘一起 | 「一个 `@` 全给你套上」的总装配 |
+
+---
+
+### 9.2 完整调用流程 Mermaid 图（假设 with_smart_retry 已接入 wrap）
+
+```mermaid
+flowchart TD
+    Start([LangGraph 调 wrapped node<br/>例如 summary_agent_harnessed]) --> Ctx[["读取 contextvar<br/>• run_id<br/>• budget"]]
+    Ctx --> StepStart[/"① 记录 step start<br/>agent_run_service.record_step_start(run_id, node)"/]
+
+    StepStart --> Breaker{"② 熔断器检查<br/>llm_breaker.allow()?"}
+
+    Breaker -- "OPEN 熔断中" --> Skip[["记 step_end status=skipped<br/>返回 errors=[熔断中]"]]
+    Skip --> EndSkip([返回 state ✗])
+
+    Breaker -- "CLOSED / HALF_OPEN 放行" --> RetryBox
+
+    subgraph RetryBox["③ with_smart_retry 包装（含 timeout）"]
+        direction TB
+        Attempt["第 N 次尝试<br/>asyncio.wait_for(func, timeout=60s)"]
+        Attempt --> RunAgent[["🤖 执行原 Agent<br/>summary_agent(state)"]]
+        RunAgent --> AgentOK{执行成功?}
+        AgentOK -- "❌ 抛异常" --> Classify["classify_error(e)<br/>→ timeout / rate_limit / auth ..."]
+        Classify --> IsRetry{可重试?}
+        IsRetry -- "✅ RETRYABLE<br/>(timeout/429/5xx/网络)" --> Backoff["指数退避 + 抖动<br/>base_delay × 2^attempt"]
+        Backoff --> Attempt
+        IsRetry -- "❌ NON_RETRYABLE<br/>(auth/quota/invalid)" --> ThrowUp[抛出异常]
+        AgentOK -- "✅ 成功" --> RetryOK[返回 result]
+    end
+
+    RetryBox --> ExHandler{"④ 外层异常分类处理"}
+
+    ExHandler -- "asyncio.TimeoutError" --> TimeoutBranch[["breaker.record_failure()<br/>记 step_end status=timeout"]]
+    ExHandler -- "BudgetExceededError" --> BudgetBranch[["记 step_end status=budget_exceeded<br/>return budget_exceeded=True"]]
+    ExHandler -- "其他 Exception" --> FailBranch[["breaker.record_failure()<br/>记 step_end status=failed"]]
+    ExHandler -- "✅ 无异常" --> Success[["breaker.record_success()<br/>熔断计数清零"]]
+
+    TimeoutBranch --> EndErr([返回 errors ✗])
+    BudgetBranch --> EndErr
+    FailBranch --> EndErr
+
+    Success --> ValCheck{"⑤ 需要输出校验?<br/>validate_output=True"}
+    ValCheck -- 否 --> BudgetSync
+    ValCheck -- 是 --> ValRun[["validate_agent_output(node, raw)<br/>• summary → 长度 ≥ 50<br/>• action_items → ActionItemOut[]<br/>• risks → RiskOut[]"]]
+    ValRun --> ValOK{校验通过?}
+    ValOK -- "❌ 不通过" --> ValFail[["记 step_end status=invalid_output<br/>return validation_failed=True<br/>（交给 output_validator 节点决定回灌）"]]
+    ValFail --> EndErr
+    ValOK -- "✅ 通过" --> Replace["用 cleaned 数据替换 result[output_field]"]
+
+    Replace --> BudgetSync[["⑥ Budget 同步到数据库<br/>agent_run_service.update_budget(<br/>&nbsp;&nbsp;used_tokens, used_cost, node_usage<br/>)"]]
+
+    BudgetSync --> BudgetCheck{超预算?}
+    BudgetCheck -- "❌ BudgetExceededError" --> BudgetBranch2[["记 step_end status=budget_exceeded"]]
+    BudgetBranch2 --> EndErr
+    BudgetCheck -- "✅ 未超" --> StepEnd[/"⑦ 记录 step end<br/>status=succeeded<br/>duration_ms=xxxms"/]
+
+    StepEnd --> EndOK([返回 state ✅])
+
+    classDef harness fill:#fff3cd,stroke:#f0ad4e,color:#000
+    classDef agent fill:#d1ecf1,stroke:#0dcaf0,color:#000
+    classDef ok fill:#d4edda,stroke:#28a745,color:#000
+    classDef fail fill:#f8d7da,stroke:#dc3545,color:#000
+    classDef check fill:#e2e3e5,stroke:#6c757d,color:#000
+
+    class StepStart,StepEnd,Skip,TimeoutBranch,BudgetBranch,BudgetBranch2,FailBranch,ValFail,Success,BudgetSync,Ctx harness
+    class RunAgent,Attempt,Backoff,Classify,ThrowUp,RetryOK,ValRun,Replace agent
+    class EndOK ok
+    class EndErr,EndSkip fail
+    class Breaker,ExHandler,ValCheck,ValOK,BudgetCheck,AgentOK,IsRetry check
+```
+
+---
+
+### 9.3 七步骤对照表（对着源码看）
+
+| # | 步骤 | 源码位置 | 通俗解释 |
+|---|---|---|---|
+| ① | 记账开单 | `wrap.py:84` `_record_step_start` | 「这一步开始跑了」→ 写进 `AgentRun.steps` |
+| ② | 熔断检查 | `wrap.py:87` `llm_breaker.allow()` | 「下游是不是已经挂了？挂了就跳过省资源」 |
+| ③ | 智能重试 | `retry.py:62` `with_smart_retry` | 「网络抖动就重试，密码错了别浪费时间」 |
+| ④ | 异常分类 | `wrap.py:103-120` `except ...` | 「按错误类型走不同的记账通道」 |
+| ⑤ | 输出校验 | `wrap.py:126-145` `validate_agent_output` | 「Agent 交的东西格式对不对？不对就 `validation_failed=True`」 |
+| ⑥ | 预算同步 | `wrap.py:149-162` `update_budget` | 「花了多少钱？写到数据库，超了就中止」 |
+| ⑦ | 记账关单 | `wrap.py:164` `_record_step_end` | 「这一步跑完了，耗时 XXX ms，状态 succeeded」 |
+
+---
+
+### 9.4 三种"出口"分别是什么状态
+
+| 出口 | 触发条件 | State 返回 | AgentRun step.status |
+|---|---|---|---|
+| ✅ **正常完成** | 节点成功 + 校验通过 + 预算未超 | `{summary: "...", ...}` | `succeeded` |
+| ✗ **被熔断跳过** | `llm_breaker.state == "open"` | `{errors: [熔断中...]}` | `skipped` |
+| ✗ **超时** | `asyncio.TimeoutError` | `{errors: [节点 xxx 超时]}` | `timeout` |
+| ✗ **预算超限** | `BudgetExceededError` | `{errors: [...], budget_exceeded: True}` | `budget_exceeded` |
+| ✗ **执行异常** | 其他任意 `Exception` | `{errors: [执行失败...]}` | `failed` |
+| ✗ **校验不合格** | Pydantic 校验挂 / 内容太短 | `{errors: [...], validation_failed: True}` | `invalid_output` |
+
+---
+
+### 9.5 CircuitBreaker 三态状态机（子图）
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED: 初始态
+
+    CLOSED --> CLOSED: record_success<br/>正常通过
+    CLOSED --> OPEN: 连续失败 ≥ 5 次<br/>fail_threshold=5
+
+    OPEN --> OPEN: allow() 直接拒绝<br/>还没到恢复时间
+    OPEN --> HALF_OPEN: 超过 recovery_timeout(60s)<br/>放行一次试探
+
+    HALF_OPEN --> CLOSED: 试探成功<br/>恢复正常
+    HALF_OPEN --> OPEN: 试探失败<br/>继续熔断
+```
+
+**通俗解释：**
+- **CLOSED（正常）**：所有请求放行，失败满 5 次跳到 OPEN
+- **OPEN（熔断）**：所有请求秒拒，60 秒后跳到 HALF_OPEN
+- **HALF_OPEN（试探）**：只放一个请求探路，成功就回 CLOSED，失败就回 OPEN
+
+---
+
+### 9.6 与项目中其它模块的关系
+
+```
+    summary_service.py
+    ├─ create_run() ────────────→ AgentRun 开单
+    ├─ BudgetGuard(run_id=...) ─→ 创建预算管理器
+    ├─ set_harness_context() ───→ 塞进 contextvar
+    │
+    └─ meeting_graph_v2.ainvoke()
+              │
+              ▼
+       每个节点（summary_agent / action_items_agent / ...）
+              │
+              ▼
+       harness_wrap 装饰器接管
+              │
+              ├─ 读 contextvar（run_id / budget）
+              ├─ 调 CircuitBreaker.allow()
+              ├─ 调 with_smart_retry(原 Agent)
+              ├─ 调 validate_agent_output()
+              ├─ 调 agent_run_service.update_budget()
+              └─ 调 agent_run_service.record_step_*()
+                        │
+                        ▼
+                  数据库 AgentRun 表
+                        │
+                        ▼
+                  前端 GET /agent-runs/{run_id} 看得到
+```
+
+**记忆口诀：**
+> **「Harness = 记账 + 保险丝 + 智能重试 + 批改老师 + 账房先生」**
+> Agent 自己只管写作文，格式、超时、预算、熔断、记账全部由 `@harness_wrap` 一个装饰器搞定。
