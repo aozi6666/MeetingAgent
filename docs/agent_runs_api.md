@@ -8,13 +8,15 @@
 
 ## 📋 二、接口一览表
 
-| # | 接口 | HTTP 方法 | 作用（做什么） | 项目中的定位（谁会用） | 涉及的 Service / 依赖 |
-|---|---|---|---|---|---|
-| 1 | `/agent-runs` | **GET** | **查列表**：分页查看所有 Agent 运行记录，可按会议 ID、状态过滤 | 「运行记录页」的主列表，管理员/开发者用来看历史跑了哪些任务 | `agent_run_service.list_runs()` |
-| 2 | `/agent-runs/tools/list` | **GET** | **查工具**：列出系统里所有已注册的工具（Tool Registry） | 前端展示"Agent 能用哪些工具"，比如调 `search`、`summarize` 等 | `app.agents.tools.registry.list_tools()` |
-| 3 | `/agent-runs/stats/overview` | **GET** | **查统计**：Dashboard 概览数据——总次数、成功率、Token 消耗、成本 | 首页仪表盘卡片，一眼看到 Agent 整体健康状况 | 直接查 `AgentRun` 表聚合（`SUM`/`COUNT`） |
-| 4 | `/agent-runs/{run_id}` | **GET** | **查详情**：某一次运行的完整信息（步骤、日志、消耗等） | 点击列表某条记录，进入详情页展示 | `agent_run_service.get_run()` |
-| 5 | `/agent-runs/{run_id}/review` | **POST** | **人工审批**：对需要人工确认的 Run 点「通过」或「拒绝」 | Agent 卡在需要人类批准的步骤时（Human-in-the-loop），审核员操作 | `agent_run_service.approve_run()` / `reject_run()` |
+
+| #   | 接口                            | HTTP 方法  | 作用（做什么）                                     | 项目中的定位（谁会用）                                   | 涉及的 Service / 依赖                                   |
+| --- | ----------------------------- | -------- | ------------------------------------------- | --------------------------------------------- | -------------------------------------------------- |
+| 1   | `/agent-runs`                 | **GET**  | **查列表**：分页查看所有 Agent 运行记录，可按会议 ID、状态过滤      | 「运行记录页」的主列表，管理员/开发者用来看历史跑了哪些任务                | `agent_run_service.list_runs()`                    |
+| 2   | `/agent-runs/tools/list`      | **GET**  | **查工具**：列出系统里所有已注册的工具（Tool Registry）        | 前端展示"Agent 能用哪些工具"，比如调 `search`、`summarize` 等 | `app.agents.tools.registry.list_tools()`           |
+| 3   | `/agent-runs/stats/overview`  | **GET**  | **查统计**：Dashboard 概览数据——总次数、成功率、Token 消耗、成本 | 首页仪表盘卡片，一眼看到 Agent 整体健康状况                     | 直接查 `AgentRun` 表聚合（`SUM`/`COUNT`）                  |
+| 4   | `/agent-runs/{run_id}`        | **GET**  | **查详情**：某一次运行的完整信息（步骤、日志、消耗等）               | 点击列表某条记录，进入详情页展示                              | `agent_run_service.get_run()`                      |
+| 5   | `/agent-runs/{run_id}/review` | **POST** | **人工审批**：对需要人工确认的 Run 点「通过」或「拒绝」            | Agent 卡在需要人类批准的步骤时（Human-in-the-loop），审核员操作   | `agent_run_service.approve_run()` / `reject_run()` |
+
 
 ---
 
@@ -41,6 +43,7 @@ GET /agent-runs?meeting_id=abc123&status=running&page=1&page_size=20
 - `page` / `page_size`：分页
 
 **返回：**
+
 ```json
 {
   "items": [...],        // 当前页的运行记录数组
@@ -58,6 +61,7 @@ GET /agent-runs?meeting_id=abc123&status=running&page=1&page_size=20
 例如：搜索会议纪要、生成摘要、查询知识库……
 
 **返回：**
+
 ```json
 { "tools": [ {...}, {...} ] }
 ```
@@ -71,6 +75,7 @@ GET /agent-runs?meeting_id=abc123&status=running&page=1&page_size=20
 **用途：** 给 Dashboard 用的一个"体检报告"。
 
 **返回示例：**
+
 ```json
 {
   "status_counts": {
@@ -86,6 +91,7 @@ GET /agent-runs?meeting_id=abc123&status=running&page=1&page_size=20
 ```
 
 **通俗理解：**
+
 - 一共跑了多少次
 - 成功多少、失败多少
 - 花了多少 Token、多少美元
@@ -96,6 +102,7 @@ GET /agent-runs?meeting_id=abc123&status=running&page=1&page_size=20
 ### 4. `GET /agent-runs/{run_id}` —— 详情接口
 
 **你会怎么用它：**
+
 ```
 GET /agent-runs/run_abc_123
 ```
@@ -103,6 +110,7 @@ GET /agent-runs/run_abc_123
 **返回：** 这次运行的所有细节（步骤、每一步用了什么工具、耗时、结果……）
 
 **特殊情况：**
+
 - 如果 `run_id` 不存在，返回 `404 Agent Run 不存在`
 
 ---
@@ -112,6 +120,7 @@ GET /agent-runs/run_abc_123
 **背景：** 有些 Agent 步骤风险大（比如"发邮件"、"删数据"），系统会**暂停**并等人类点头。
 
 **请求 Body：**
+
 ```json
 {
   "reviewer": "张三",       // 审核人
@@ -121,12 +130,16 @@ GET /agent-runs/run_abc_123
 ```
 
 **两种结果：**
-| action | 效果 |
-|---|---|
+
+
+| action    | 效果              |
+| --------- | --------------- |
 | `approve` | ✅ 通过，Agent 继续执行 |
-| `reject` | ❌ 拒绝，Run 直接终止 |
+| `reject`  | ❌ 拒绝，Run 直接终止   |
+
 
 **报错情况：**
+
 - Run 不存在 → `404`
 - 已经审批过了（不是 `pending` 状态） → `400`，避免重复操作
 
@@ -134,12 +147,14 @@ GET /agent-runs/run_abc_123
 
 ## 🧩 四、和其他模块的关系
 
-| 依赖对象 | 来自哪里 | 干什么用的 |
-|---|---|---|
-| `agent_run_service` | `app/services/agent_run_service.py` | 真正查库、更新状态的地方 |
-| `list_tools` | `app/agents/tools/registry.py` | 拿到所有注册工具的列表 |
-| `AgentRun` 模型 | `app/models/agent_run.py` | 数据库表的 ORM 定义 |
-| `get_db` | `app/api/deps.py` | FastAPI 的数据库会话依赖 |
+
+| 依赖对象                | 来自哪里                                | 干什么用的            |
+| ------------------- | ----------------------------------- | ---------------- |
+| `agent_run_service` | `app/services/agent_run_service.py` | 真正查库、更新状态的地方     |
+| `list_tools`        | `app/agents/tools/registry.py`      | 拿到所有注册工具的列表      |
+| `AgentRun` 模型       | `app/models/agent_run.py`           | 数据库表的 ORM 定义     |
+| `get_db`            | `app/api/deps.py`                   | FastAPI 的数据库会话依赖 |
+
 
 ---
 
@@ -193,7 +208,7 @@ flowchart TD
 
     Validator{🔍 output_validator<br/>验货：格式对不对？<br/>内容合不合理？}
 
-    Validator -->|不合格 &amp; 有 retry_node| Retry[🔁 回灌重跑<br/>指定的 Agent]
+    Validator -->|不合格 & 有 retry_node| Retry[🔁 回灌重跑<br/>指定的 Agent]
     Retry -.重试计数 +1.-> SummaryAgent
     Retry -.重试计数 +1.-> ActionAgent
     Retry -.重试计数 +1.-> RisksAgent
@@ -219,19 +234,23 @@ flowchart TD
     class PausedEnd,RejectEnd,Retry pause
 ```
 
+
+
 ### 6.2 图里每个节点做啥（对照源码）
 
-| 节点 | 源码来源 | 通俗解释 |
-|---|---|---|
-| `planner` | `nodes/planner.py` | 分析会议类型/敏感度，决定 `plan.should_run_xxx` 开关 |
-| `budget_check` | `nodes/budget_check.py` | 检查预算 + 长文本压缩（`transcript_compressed`） |
-| `summary_agent` | v1 里的老 agent + `harness_wrap` | 写摘要 |
-| `action_items_agent` | v1 里的老 agent + `harness_wrap` | 抽行动项 |
-| `risks_agent` | v1 里的老 agent + `harness_wrap` | 识别风险 |
-| `decision_extractor` | `nodes/decision_extractor.py` + `harness_wrap` | Q8 新增：抽决策（detect + extract 两步） |
-| `output_validator` | `nodes/output_validator.py` | 校验产出，不合格设 `retry_node` 回灌 |
-| `human_review` | `nodes/human_review.py` | 高风险审批闸门 |
-| `persist` | 本文件内 `persist_node` | 只打个"我完事了"的标记 |
+
+| 节点                   | 源码来源                                           | 通俗解释                                   |
+| -------------------- | ---------------------------------------------- | -------------------------------------- |
+| `planner`            | `nodes/planner.py`                             | 分析会议类型/敏感度，决定 `plan.should_run_xxx` 开关 |
+| `budget_check`       | `nodes/budget_check.py`                        | 检查预算 + 长文本压缩（`transcript_compressed`）  |
+| `summary_agent`      | v1 里的老 agent + `harness_wrap`                  | 写摘要                                    |
+| `action_items_agent` | v1 里的老 agent + `harness_wrap`                  | 抽行动项                                   |
+| `risks_agent`        | v1 里的老 agent + `harness_wrap`                  | 识别风险                                   |
+| `decision_extractor` | `nodes/decision_extractor.py` + `harness_wrap` | Q8 新增：抽决策（detect + extract 两步）         |
+| `output_validator`   | `nodes/output_validator.py`                    | 校验产出，不合格设 `retry_node` 回灌              |
+| `human_review`       | `nodes/human_review.py`                        | 高风险审批闸门                                |
+| `persist`            | 本文件内 `persist_node`                            | 只打个"我完事了"的标记                           |
+
 
 ---
 
@@ -301,21 +320,23 @@ Agent 跑完之后，这张便利贴长这样：
 
 ### 7.2 每个字段是谁写的（跟着流程走）
 
-| 字段 | 谁写进去 | 什么时候写 |
-|---|---|---|
-| `meeting_id` / `meeting_title` / `transcript_text` | **summary_service** 传入 | 一开始 `initial_state` |
-| `plan` | `planner` 节点 | 第 1 步 |
-| `transcript_compressed(_text)` / `budget_exceeded` | `budget_check` 节点 | 第 2 步 |
-| `summary` / `key_points` | `summary_agent` | 干活时 |
-| `action_items` | `action_items_agent` | 干活时 |
-| `risks` | `risks_agent` | 干活时 |
-| `decisions` | `decision_extractor` | 干活时 |
-| `xxx_retry` | `output_validator` 触发回灌 → 节点自己 +1 | 每次重跑 |
-| `valid` / `retry_node` / `retry_reason` / `validation_failed` | `output_validator` | 验货后 |
-| `paused` / `review_status` / `review_xxx_preview/count` | `human_review` | 审批闸门 |
-| `approved` | 人工审批（`POST /agent-runs/{run_id}/review`）回灌 | 审完 |
-| `persisted` | `persist` 节点 | 收尾 |
-| `errors` | 任何节点出错都能追加（`Annotated[list, operator.add]`） | 任何时候 |
+
+| 字段                                                            | 谁写进去                                        | 什么时候写               |
+| ------------------------------------------------------------- | ------------------------------------------- | ------------------- |
+| `meeting_id` / `meeting_title` / `transcript_text`            | **summary_service** 传入                      | 一开始 `initial_state` |
+| `plan`                                                        | `planner` 节点                                | 第 1 步               |
+| `transcript_compressed(_text)` / `budget_exceeded`            | `budget_check` 节点                           | 第 2 步               |
+| `summary` / `key_points`                                      | `summary_agent`                             | 干活时                 |
+| `action_items`                                                | `action_items_agent`                        | 干活时                 |
+| `risks`                                                       | `risks_agent`                               | 干活时                 |
+| `decisions`                                                   | `decision_extractor`                        | 干活时                 |
+| `xxx_retry`                                                   | `output_validator` 触发回灌 → 节点自己 +1           | 每次重跑                |
+| `valid` / `retry_node` / `retry_reason` / `validation_failed` | `output_validator`                          | 验货后                 |
+| `paused` / `review_status` / `review_xxx_preview/count`       | `human_review`                              | 审批闸门                |
+| `approved`                                                    | 人工审批（`POST /agent-runs/{run_id}/review`）回灌  | 审完                  |
+| `persisted`                                                   | `persist` 节点                                | 收尾                  |
+| `errors`                                                      | 任何节点出错都能追加（`Annotated[list, operator.add]`） | 任何时候                |
+
 
 > **⚠️ 有两个"藏起来的"字段不在 State 里：** `agent_run_id` 和 `budget_guard`——它们通过 Python 的 `contextvar` 传递，避免污染 State（源码第 67 行注释）。
 
@@ -439,12 +460,14 @@ summary_service 说"开工！"
 
 **一图记住三层分工：**
 
-| 层 | 谁 | 干啥 |
-|---|---|---|
-| 编排层 | `meeting_graph_v2.py` | 定义流程图 + State 结构 |
-| 执行层 | `nodes/*.py` + 4 个 Agent | 真正干活，写便利贴 |
-| 记账层 | `agent_run_service.py` | 全程往 Run 单上记 |
-| 监控层 | `agent_runs.py` (本文档主角) | 暴露 HTTP 接口给前端看 Run 单 |
+
+| 层   | 谁                        | 干啥                   |
+| --- | ------------------------ | -------------------- |
+| 编排层 | `meeting_graph_v2.py`    | 定义流程图 + State 结构     |
+| 执行层 | `nodes/*.py` + 4 个 Agent | 真正干活，写便利贴            |
+| 记账层 | `agent_run_service.py`   | 全程往 Run 单上记          |
+| 监控层 | `agent_runs.py` (本文档主角)  | 暴露 HTTP 接口给前端看 Run 单 |
+
 
 ---
 
@@ -456,13 +479,15 @@ summary_service 说"开工！"
 
 ### 9.1 五大组件是啥
 
-| 组件 | 文件 | 一句话作用 | 通俗理解 |
-|---|---|---|---|
-| **BudgetGuard** | `budget.py` | Token / 成本双闸门 | 「还剩多少钱，超了就停」的账房先生 |
-| **CircuitBreaker** | `circuit_breaker.py` | 三态熔断器（CLOSED/OPEN/HALF_OPEN） | 「下游挂了就先别打了，等一会再试探」的保险丝 |
-| **with_smart_retry** | `retry.py` | 错误分类 + 指数退避 + 抖动 | 「网络抖动重试，密码错误不重试」的智能重试 |
-| **OutputValidator** | `validator.py` | Pydantic 结构校验 | 「Agent 交作业，先检查格式对不对」的批改老师 |
-| **harness_wrap** | `wrap.py` | 装饰器，把上面 4 个粘一起 | 「一个 `@` 全给你套上」的总装配 |
+
+| 组件                   | 文件                   | 一句话作用                        | 通俗理解                      |
+| -------------------- | -------------------- | ---------------------------- | ------------------------- |
+| **BudgetGuard**      | `budget.py`          | Token / 成本双闸门                | 「还剩多少钱，超了就停」的账房先生         |
+| **CircuitBreaker**   | `circuit_breaker.py` | 三态熔断器（CLOSED/OPEN/HALF_OPEN） | 「下游挂了就先别打了，等一会再试探」的保险丝    |
+| **with_smart_retry** | `retry.py`           | 错误分类 + 指数退避 + 抖动             | 「网络抖动重试，密码错误不重试」的智能重试     |
+| **OutputValidator**  | `validator.py`       | Pydantic 结构校验                | 「Agent 交作业，先检查格式对不对」的批改老师 |
+| **harness_wrap**     | `wrap.py`            | 装饰器，把上面 4 个粘一起               | 「一个 `@` 全给你套上」的总装配        |
+
 
 ---
 
@@ -512,7 +537,7 @@ flowchart TD
     ValFail --> EndErr
     ValOK -- "✅ 通过" --> Replace["用 cleaned 数据替换 result[output_field]"]
 
-    Replace --> BudgetSync[["⑥ Budget 同步到数据库<br/>agent_run_service.update_budget(<br/>&nbsp;&nbsp;used_tokens, used_cost, node_usage<br/>)"]]
+    Replace --> BudgetSync[["⑥ Budget 同步到数据库<br/>agent_run_service.update_budget(<br/>  used_tokens, used_cost, node_usage<br/>)"]]
 
     BudgetSync --> BudgetCheck{超预算?}
     BudgetCheck -- "❌ BudgetExceededError" --> BudgetBranch2[["记 step_end status=budget_exceeded"]]
@@ -534,32 +559,38 @@ flowchart TD
     class Breaker,ExHandler,ValCheck,ValOK,BudgetCheck,AgentOK,IsRetry check
 ```
 
+
+
 ---
 
 ### 9.3 七步骤对照表（对着源码看）
 
-| # | 步骤 | 源码位置 | 通俗解释 |
-|---|---|---|---|
-| ① | 记账开单 | `wrap.py:84` `_record_step_start` | 「这一步开始跑了」→ 写进 `AgentRun.steps` |
-| ② | 熔断检查 | `wrap.py:87` `llm_breaker.allow()` | 「下游是不是已经挂了？挂了就跳过省资源」 |
-| ③ | 智能重试 | `retry.py:62` `with_smart_retry` | 「网络抖动就重试，密码错了别浪费时间」 |
-| ④ | 异常分类 | `wrap.py:103-120` `except ...` | 「按错误类型走不同的记账通道」 |
-| ⑤ | 输出校验 | `wrap.py:126-145` `validate_agent_output` | 「Agent 交的东西格式对不对？不对就 `validation_failed=True`」 |
-| ⑥ | 预算同步 | `wrap.py:149-162` `update_budget` | 「花了多少钱？写到数据库，超了就中止」 |
-| ⑦ | 记账关单 | `wrap.py:164` `_record_step_end` | 「这一步跑完了，耗时 XXX ms，状态 succeeded」 |
+
+| #   | 步骤   | 源码位置                                      | 通俗解释                                           |
+| --- | ---- | ----------------------------------------- | ---------------------------------------------- |
+| ①   | 记账开单 | `wrap.py:84` `_record_step_start`         | 「这一步开始跑了」→ 写进 `AgentRun.steps`                 |
+| ②   | 熔断检查 | `wrap.py:87` `llm_breaker.allow()`        | 「下游是不是已经挂了？挂了就跳过省资源」                           |
+| ③   | 智能重试 | `retry.py:62` `with_smart_retry`          | 「网络抖动就重试，密码错了别浪费时间」                            |
+| ④   | 异常分类 | `wrap.py:103-120` `except ...`            | 「按错误类型走不同的记账通道」                                |
+| ⑤   | 输出校验 | `wrap.py:126-145` `validate_agent_output` | 「Agent 交的东西格式对不对？不对就 `validation_failed=True`」 |
+| ⑥   | 预算同步 | `wrap.py:149-162` `update_budget`         | 「花了多少钱？写到数据库，超了就中止」                            |
+| ⑦   | 记账关单 | `wrap.py:164` `_record_step_end`          | 「这一步跑完了，耗时 XXX ms，状态 succeeded」                |
+
 
 ---
 
 ### 9.4 三种"出口"分别是什么状态
 
-| 出口 | 触发条件 | State 返回 | AgentRun step.status |
-|---|---|---|---|
-| ✅ **正常完成** | 节点成功 + 校验通过 + 预算未超 | `{summary: "...", ...}` | `succeeded` |
-| ✗ **被熔断跳过** | `llm_breaker.state == "open"` | `{errors: [熔断中...]}` | `skipped` |
-| ✗ **超时** | `asyncio.TimeoutError` | `{errors: [节点 xxx 超时]}` | `timeout` |
-| ✗ **预算超限** | `BudgetExceededError` | `{errors: [...], budget_exceeded: True}` | `budget_exceeded` |
-| ✗ **执行异常** | 其他任意 `Exception` | `{errors: [执行失败...]}` | `failed` |
-| ✗ **校验不合格** | Pydantic 校验挂 / 内容太短 | `{errors: [...], validation_failed: True}` | `invalid_output` |
+
+| 出口          | 触发条件                          | State 返回                                   | AgentRun step.status |
+| ----------- | ----------------------------- | ------------------------------------------ | -------------------- |
+| ✅ **正常完成**  | 节点成功 + 校验通过 + 预算未超            | `{summary: "...", ...}`                    | `succeeded`          |
+| ✗ **被熔断跳过** | `llm_breaker.state == "open"` | `{errors: [熔断中...]}`                       | `skipped`            |
+| ✗ **超时**    | `asyncio.TimeoutError`        | `{errors: [节点 xxx 超时]}`                    | `timeout`            |
+| ✗ **预算超限**  | `BudgetExceededError`         | `{errors: [...], budget_exceeded: True}`   | `budget_exceeded`    |
+| ✗ **执行异常**  | 其他任意 `Exception`              | `{errors: [执行失败...]}`                      | `failed`             |
+| ✗ **校验不合格** | Pydantic 校验挂 / 内容太短           | `{errors: [...], validation_failed: True}` | `invalid_output`     |
+
 
 ---
 
@@ -579,7 +610,10 @@ stateDiagram-v2
     HALF_OPEN --> OPEN: 试探失败<br/>继续熔断
 ```
 
+
+
 **通俗解释：**
+
 - **CLOSED（正常）**：所有请求放行，失败满 5 次跳到 OPEN
 - **OPEN（熔断）**：所有请求秒拒，60 秒后跳到 HALF_OPEN
 - **HALF_OPEN（试探）**：只放一个请求探路，成功就回 CLOSED，失败就回 OPEN
@@ -617,5 +651,138 @@ stateDiagram-v2
 ```
 
 **记忆口诀：**
+
 > **「Harness = 记账 + 保险丝 + 智能重试 + 批改老师 + 账房先生」**
 > Agent 自己只管写作文，格式、超时、预算、熔断、记账全部由 `@harness_wrap` 一个装饰器搞定。
+
+---
+
+## 🔁 八、附录：回灌重试（Self-Correction Loop）
+
+> **一句话定位：** 当 Agent 产出的东西**"格式不对/内容不合理"**时，工作流会**自动跳回那个 Agent 让它重做**，最多 2 次。这才是"Agent 会自我纠错"的核心。
+
+### 8.1 涉及的 3 个文件（源码地图）
+
+| 文件 | 角色 | 关键点 |
+|---|---|---|
+| `nodes/output_validator.py` | 🕵️ **裁判**——判断合不合格 | 调 `validate_agent_output()`，不合格就设 `retry_node` + `retry_reason`，同时把 `xxx_retry` 计数 +1 |
+| `meeting_graph_v2.py` 的 `route_after_validator()` | 🚦 **导航员**——决定跳去哪 | 有 `retry_node` → 跳回那个 Agent；没有 → 去 `human_review` |
+| `harness/wrap.py` | 🏭 **工人工位**——Agent 被再次执行 | 重跑那个 Agent（Harness 全套：熔断/超时/校验/记账） |
+
+### 8.2 回灌循环 Mermaid 图（小白版）
+
+```mermaid
+flowchart TD
+    Start([🚀 某 Agent 首次执行<br/>例如 risks_agent]) --> Wrap
+
+    Wrap[🏭 harness_wrap 包裹执行<br/>熔断 / 超时 / 记账]
+    Wrap --> Validator
+
+    Validator[🕵️ output_validator_node<br/>遍历 3 个 Agent 的产出]
+    Validator --> CallLib
+
+    CallLib[📏 调 validate_agent_output<br/>Pydantic 校验：severity/priority/长度…]
+    CallLib --> IsOk{合格？}
+
+    IsOk -->|✅ 合格| CleanOk[cleaned_updates 收集清洗后的数据<br/>continue 检查下一个 Agent]
+    CleanOk --> AllDone{全部检查完？}
+    AllDone -->|全部通过| ReturnOk[["返回<br/>{valid: True,<br/>回写 cleaned_updates,<br/>retry_node: None}"]]
+    ReturnOk --> Router1
+
+    IsOk -->|❌ 不合格| CheckCount{"retry_count < 2 ?<br/>（MAX_RETRY_PER_NODE）"}
+
+    CheckCount -->|"还能重试<br/>(0→1 或 1→2)"| SetRetry[["设置回灌信号<br/>retry_node = 'risks_agent'<br/>retry_reason = 'severity非法'<br/>risks_agent_retry += 1"]]
+
+    SetRetry --> Router2
+
+    Router2[🚦 route_after_validator<br/>meeting_graph_v2.py 137-152 行]
+    Router2 --> ReadRetry{读 state<br/>retry_node?}
+    ReadRetry -->|有值| JumpBack[/return retry_node/]
+    JumpBack -.LangGraph add_edge<br/>回灌到指定 Agent.-> Wrap
+
+    CheckCount -->|"达到 2 次上限"| Exhausted[["retry_node = None<br/>errors.append('...重试耗尽')<br/>保留原始输出兜底"]]
+    Exhausted --> Router3
+
+    Router3[🚦 route_after_validator]
+    Router3 --> NoRetry[/retry_node 为 None/]
+    NoRetry --> HumanReview([👤 human_review<br/>带着 errors 走审批])
+
+    Router1 --> RouterOk[🚦 route_after_validator]
+    RouterOk --> ValidOk[/valid=True<br/>retry_node=None/]
+    ValidOk --> HumanReviewOk([👤 human_review<br/>正常审批])
+
+    classDef agent fill:#e1f5ff,stroke:#0288d1,color:#000
+    classDef judge fill:#fff3e0,stroke:#f57c00,color:#000
+    classDef router fill:#f3e5f5,stroke:#8e24aa,color:#000
+    classDef ok fill:#e8f5e9,stroke:#43a047,color:#000
+    classDef bad fill:#ffebee,stroke:#e53935,color:#000
+    classDef terminal fill:#eceff1,stroke:#546e7a,color:#000
+
+    class Start,Wrap agent
+    class Validator,CallLib,IsOk,CheckCount judge
+    class Router2,Router3,RouterOk,ReadRetry,NoRetry,ValidOk,JumpBack router
+    class CleanOk,AllDone,ReturnOk ok
+    class SetRetry,Exhausted bad
+    class HumanReview,HumanReviewOk terminal
+```
+
+### 8.3 一场"回灌循环"的真实剧本
+
+假设 `risks_agent` 第一次输出的 `severity` 是 `"严重"`（不是 `high/medium/low`）：
+
+```
+第 1 轮：
+  risks_agent → 产出 [{severity: "严重"}]
+       ↓
+  output_validator → Pydantic 校验失败 "severity 非法"
+       ↓
+  设置 retry_node="risks_agent", risks_agent_retry=1
+       ↓
+  route_after_validator → return "risks_agent"
+       ↓
+  LangGraph 跳回 risks_agent（第二次执行）
+
+第 2 轮：
+  risks_agent → 又产出 [{severity: "very high"}]（还是错）
+       ↓
+  output_validator → 校验又失败
+       ↓
+  设置 retry_node="risks_agent", risks_agent_retry=2
+       ↓
+  route_after_validator → 又跳回 risks_agent
+
+第 3 轮：
+  risks_agent → 假设还是错
+       ↓
+  output_validator → retry_count(2) >= MAX_RETRY(2)
+       ↓
+  ❌ 不再回灌！
+  errors.append("risks_agent 输出校验失败（重试耗尽）")
+  retry_node = None
+       ↓
+  route_after_validator → 去 human_review（带着 errors）
+```
+
+### 8.4 关键代码位置速查
+
+| 想看什么 | 去哪里看 | 行号 |
+|---|---|---|
+| 重试上限值 `MAX_RETRY_PER_NODE = 2` | `nodes/output_validator.py` | 20 |
+| 校验失败设 `retry_node` | `nodes/output_validator.py` | 50-61 |
+| 重试耗尽兜底逻辑 | `nodes/output_validator.py` | 63-69 |
+| 路由决策（跳回哪个 Agent） | `meeting_graph_v2.py` `route_after_validator` | 137-152 |
+| Agent → validator 的边 | `meeting_graph_v2.py` `add_edge` | 190-193 |
+| validator → 动态路由 | `meeting_graph_v2.py` `add_conditional_edges` | 196 |
+| Pydantic 校验规则 | `harness/validator.py` `ActionItemOut` / `RiskOut` | 14-54 |
+
+### 8.5 「回灌重试」vs「智能重试」（别混淆⚠️）
+
+| 对比 | 回灌重试（本节） | 智能重试（`harness/retry.py`） |
+|---|---|---|
+| **在哪一层** | **工作流层**——整个 Agent 节点重跑 | **调用层**——一次 LLM 请求内重试 |
+| **触发条件** | 输出**格式/内容**不合格 | LLM 调用**报错**（超时/限流/5xx） |
+| **上限** | 每个 Agent 2 次（`MAX_RETRY_PER_NODE`） | 3 次（`max_retries=3`） |
+| **谁在管** | `output_validator_node` + `route_after_validator` | `with_smart_retry` 函数 |
+| **代价** | 重跑整个 Agent（贵，Token 消耗大） | 只重发一次 LLM 请求（便宜） |
+
+> **一句话总结：** 智能重试是"这次网络抽风，我再打一遍电话"；回灌重试是"你写的作业格式不对，回去重写"。
