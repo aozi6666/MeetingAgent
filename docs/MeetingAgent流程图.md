@@ -786,3 +786,237 @@ flowchart TD
 | **代价** | 重跑整个 Agent（贵，Token 消耗大） | 只重发一次 LLM 请求（便宜） |
 
 > **一句话总结：** 智能重试是"这次网络抽风，我再打一遍电话"；回灌重试是"你写的作业格式不对，回去重写"。
+
+---
+
+## 🎯 九、决策两步流水线图（decision_extractor）
+
+> 文件：`nodes/decision_extractor.py` + `nodes/decision_detector.py` + `nodes/option_extractor.py`
+>
+> 一句话定位：**决策抽取 = 先"找准"（Step 1 判断是不是拍板），再"抽细"（Step 2 抽取具体内容）**。两步分开，是为了让 LLM 一次只干一件事。
+
+```mermaid
+flowchart TD
+    A["decision_extractor · 总工头<br/>拿 transcript_text<br/>（或 budget_check 压缩后文本）"] --> B{"有文本?"}
+    B -- "无" --> Z["decisions = [] <br/>跳过，不阻塞主流程"]
+    B -- "有" --> C
+
+    subgraph S1["Step 1 · 找准（decision_detector）<br/>这里拍板了吗?"]
+        C["detect_decisions()<br/>LLM 全量扫描（截断 8000 字）"] --> D["候选段<br/>type + confidence"]
+        D --> E{"type = decision<br/>且 conf ≥ 0.7?"}
+        E -- "✗ proposal / deferred / 低置信" --> F["丢弃"]
+        E -- "✓" --> G["DecisionSegment<br/>（原文 snippet）"]
+    end
+
+    G --> LOOP{"还有段要抽?"}
+
+    subgraph S2["Step 2 · 抽细（option_extractor）<br/>具体拍板了什么?"]
+        H["extract_options(seg, transcript)"] --> I["find(snippet) 定位<br/>snippet ± 500 字上下文"]
+        I --> K["LLM 结构化抽取"]
+        K --> L["ExtractedDecision<br/>title / options / chosen<br/>reasons / objections / decided_by"]
+        L --> M{"Pydantic 合法<br/>且 chosen ∈ options?"}
+        M -- "✗" --> N["丢弃该段<br/>（不影响后续段）"]
+        M -- "✓" --> O["model_dump → dict<br/>补 decided_at"]
+    end
+
+    LOOP -- "有" --> H
+    N --> LOOP
+    O --> LOOP
+    LOOP -- "无" --> P["state['decisions']"]
+```
+
+### 9.1 关键点速查
+
+| 关键点 | 位置 | 说明 |
+|---|---|---|
+| 两步入口编排 | `decision_extractor.py` 41 / 60 | 先 `detect_decisions` 再 `extract_options` |
+| 三分类定义 | `decision_detector.py` 26-28 | `decision` / `proposal` / `deferred` |
+| 正反例 Prompt | `decision_detector.py` 32-52 | `DETECTOR_PROMPT` |
+| 过滤条件 | `decision_detector.py` 104 | `type=="decision" and confidence>=0.7` |
+| 前后 500 字上下文 | `option_extractor.py` 97-99 | `idx-500` / `idx+500` |
+| chosen 兜底校验 | `option_extractor.py` 148-155 | chosen 不在 options 里就取第一个 |
+
+> **一句话总结：** Step 1 问"这是不是拍板"，只放行"拍板 + 高置信"的段；Step 2 拿到"一段已确认的决策 + 前后 500 字"，专心抽"标题/选项/理由"，不用再纠结"这到底算不算决策"。
+
+---
+
+## 🗺️ 十、端到端总览：从「生成纪要」到落库（全后端主链路）
+
+> 一句话定位：**整个后端基本围着这条链路转**——前端点「生成纪要」→ API → `SummaryService` 备料 → `meeting_graph_v2` 多 Agent 出货 → Service 接住 `final_state` 落库（含决策图谱）。
+>
+> 对照源码：`api/summaries.py` → `services/summary_service.py` → `agents/meeting_graph_v2.py` → `services/decision_graph_service.py`
+
+### 10.1 Mermaid 总流程图（少字版）
+
+```mermaid
+flowchart TD
+    UI["前端 · 生成纪要"] --> API["POST /meetings/{id}/summarize"]
+    API --> SS["SummaryService.generate_summary"]
+
+    subgraph Prep["① 备料"]
+        SS --> M["查 Meeting"]
+        M --> T["查 Transcript → 拼文本"]
+        T --> Del["删旧 Summary / ActionItem / Risk"]
+        Del --> S0["建 Summary status=generating"]
+        S0 --> AR["建 AgentRun + start"]
+        AR --> BG["建 BudgetGuard + set_harness_context"]
+    end
+
+    BG --> P
+
+    subgraph G["② meeting_graph_v2"]
+        P["planner"] --> BC["budget_check"]
+        BC --> FO{{fan-out · plan 开关}}
+
+        FO --> SA["summary_agent"]
+        FO --> AA["action_items_agent"]
+        FO --> RA["risks_agent"]
+        FO --> DE["decision_extractor"]
+
+        SA --> V["output_validator"]
+        AA --> V
+        RA --> V
+        DE --> V
+
+        V -->|retry_node| SA
+        V -->|retry_node| AA
+        V -->|retry_node| RA
+        V -->|paused| END1([END · 等审批])
+        V -->|ok| HR["human_review"]
+
+        HR -->|approved| PS["persist · 仅打标"]
+        HR -->|否| END2([END])
+        PS --> END3([Graph END])
+    end
+
+    END3 --> FS["返回 final_state"]
+    END1 --> PAUSED["summary.status = paused"]
+
+    subgraph Persist["③ SummaryService 接住结果"]
+        FS --> SUM["summary / key_points → summaries"]
+        FS --> AI["action_items → action_items"]
+        FS --> RK["risks → risks"]
+        FS --> DEC{"decisions?"}
+    end
+
+    DEC -->|有| DGS["DecisionGraphService.save_decisions"]
+    DEC -->|无| IDX
+
+    subgraph DG["④ 决策图谱"]
+        DGS --> EMB["embedding title+context"]
+        EMB --> D1["decisions"]
+        EMB --> D2["decision_options"]
+        EMB --> D3["decision_relations · top-3 相似"]
+    end
+
+    D1 --> IDX
+    D2 --> IDX
+    D3 --> IDX
+    IDX["knowledge_service 索引纪要"] --> DONE["status=completed"]
+
+    classDef entry fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef svc fill:#fff8e1,stroke:#f9a825,color:#000
+    classDef graph fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    classDef endn fill:#eceff1,stroke:#546e7a,color:#000
+
+    class UI,API entry
+    class SS,DGS,IDX svc
+    class P,BC,FO,SA,AA,RA,DE,V,HR,PS graph
+    class SUM,AI,RK,D1,D2,D3,EMB db
+    class END1,END2,END3,DONE,PAUSED endn
+```
+
+### 10.2 和代码怎么对上
+
+| 阶段 | 谁在干 | 关键动作 |
+|---|---|---|
+| 入口 | `POST .../summarize` | `api/summaries.py` → `summary_service.generate_summary` |
+| 备料 | `SummaryService` | 查会 / 拼转写 / 建 `Summary(generating)` / `AgentRun` / `BudgetGuard` |
+| 图内 | `meeting_graph_v2` | Planner → Budget → 四路 fan-out → Validator（可回灌）→ HumanReview → Persist（只标 `persisted`） |
+| 接结果 | `SummaryService._run_v2_workflow` | 写 `summaries` / `action_items` / `risks`；`paused` 则停；`errors` 则 `failed` |
+| 决策 | `DecisionGraphService` | `decisions` + `decision_options` + embedding + `decision_relations`（失败不影响纪要） |
+| 收尾 | `knowledge_service` | 成功后把纪要索引进知识库 |
+
+### 10.3 记三条就够
+
+1. **图内 `persist` 不落业务表**——真正写库在 `SummaryService` 拿到 `final_state` 之后。
+2. **四路并行**由 `plan.should_run_*` 决定；Validator 只管摘要/行动/风险，决策节点自带 Pydantic。
+3. **决策落库独立且可失败**：纪要已成，向量关联挂了也不回滚纪要。
+
+
+---
+
+## 💰 十一、预算线：BudgetGuard 如何穿过整张图
+
+> 一句话定位：**BudgetGuard 不进 LangGraph State**——`SummaryService` 建好后塞进 `contextvar`，图内任意节点用 `get_budget()` 取出记账；超限抛 `BudgetExceededError`，由 `harness_wrap` 拦住。
+>
+> 对照源码：`summary_service.py` → `harness/wrap.py` → `harness/budget.py` →（Agent / Detector / Extractor）→ `agent_run_service.update_budget`
+
+### 11.1 Mermaid 预算线（少字版）
+
+```mermaid
+flowchart TD
+    SS["SummaryService._run_v2"] --> BG["new BudgetGuard<br/>max_tokens / max_cost"]
+    BG --> SET["set_harness_context<br/>run_id + budget"]
+    SET --> CV["contextvar<br/>_run_id_var / _budget_var"]
+
+    CV --> HW["harness_wrap<br/>读 run_id + budget"]
+    CV --> SA
+    CV --> DD
+    CV --> OE
+
+    subgraph AGENTS["图内消费者"]
+        SA["summary / action / risks<br/>_invoke_with_retry"]
+        DD["DecisionDetector<br/>get_budget()"]
+        OE["OptionExtractor<br/>get_budget()"]
+    end
+
+    SA --> TRY["_try_consume_budget"]
+    DD --> CON
+    OE --> CON
+    TRY --> CON["BudgetGuard.consume()"]
+
+    CON --> GATE{"Token / 成本<br/>超限?"}
+    GATE -->|是| ERR["BudgetExceededError"]
+    GATE -->|否| MEM["内存累计<br/>used_tokens / used_cost / node_usage"]
+
+    ERR --> HW2["harness_wrap 捕获<br/>budget_exceeded → errors"]
+    MEM --> DB["agent_run_service.update_budget<br/>→ AgentRun 表"]
+    HW -.节点成功后再同步.-> DB
+
+    classDef svc fill:#fff8e1,stroke:#f9a825,color:#000
+    classDef ctx fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef agent fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef gate fill:#fce4ec,stroke:#c62828,color:#000
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#000
+
+    class SS,BG,SET svc
+    class CV,HW ctx
+    class SA,DD,OE,TRY,CON agent
+    class GATE,ERR,HW2 gate
+    class MEM,DB db
+```
+
+### 11.2 为什么用 contextvar（不是 State）
+
+| 做法 | 行不行 | 原因 |
+|---|---|---|
+| 放进 `MeetingAgentStateV2` | ❌ | `BudgetGuard` 可变；LangGraph 会序列化 / 过滤非 TypedDict 字段 |
+| `contextvar` | ✅ | 同一次 `ainvoke` 调用链共享；节点零侵入 `get_budget()` |
+
+### 11.3 两条记账入口（汇到同一 `consume`）
+
+| 入口 | 谁调用 | 怎么记 |
+|---|---|---|
+| A · LangChain Agent | `meeting_graph._try_consume_budget` | response.`usage_metadata` → `consume(node="llm:模型名")` |
+| B · 决策两步 | `decision_detector` / `option_extractor` | OpenAI `resp.usage` → `consume(node=节点名)` |
+
+`consume` 内做两道闸：`used_tokens > max_tokens` 或 `used_cost > max_cost_cny` → 抛错；否则写内存 + 异步刷 `AgentRun`。
+
+### 11.4 记三条就够
+
+1. **注入一次，全图可见**：`set_harness_context` 只在进图前调一次。
+2. **记账靠 `get_budget().consume()`**，不是靠 State 字段累加。
+3. **超限不重试**：`BudgetExceededError` 直达 `harness_wrap`，节点标 `budget_exceeded`。
+
