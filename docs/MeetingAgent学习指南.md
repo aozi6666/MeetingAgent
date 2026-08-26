@@ -109,46 +109,6 @@ main.py 创建 FastAPI app
 - `update(Meeting).where(...).values(...)`：SQLAlchemy 更新语句。
 - `TRANSCRIPTION_PROVIDER=auto/mock/dashscope`：本地可用 Mock 跑通流程。
 
-### 第 4 站：决策抽取和决策库
-
-先读：
-
-- `backend/app/agents/nodes/decision_extractor.py`
-- `backend/app/agents/nodes/decision_detector.py`
-- `backend/app/agents/nodes/option_extractor.py`
-- `backend/app/services/decision_graph_service.py`
-- `backend/app/models/decision.py`
-- `backend/app/api/decisions.py`
-
-决策抽取是两步：
-
-```text
-DecisionDetector
-  -> 从完整转写里定位“可能是决策”的片段
-  -> 过滤低置信度内容
-
-OptionExtractor
-  -> 对每个决策片段抽结构化字段
-  -> 标题、背景、候选方案、已选方案、理由、反对意见、决策人
-```
-
-落库时会写三类表：
-
-- `decisions`：决策主表，带 `embedding` 向量列。
-- `decision_options`：候选方案。
-- `decision_relations`：相似历史决策关系。
-
-重点理解 `DecisionGraphService.save_decisions()`：
-
-```text
-删除该会议旧决策
-  -> 对 title + context 做 embedding
-  -> 写 decisions
-  -> 写 decision_options
-  -> 检索 top-3 相似历史决策
-  -> 写 decision_relations 双向关系
-```
-
 ### 第 5 站：知识库与 RAG
 
 先读：

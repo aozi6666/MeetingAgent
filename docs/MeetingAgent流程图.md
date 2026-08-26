@@ -1020,3 +1020,150 @@ flowchart TD
 2. **记账靠 `get_budget().consume()`**，不是靠 State 字段累加。
 3. **超限不重试**：`BudgetExceededError` 直达 `harness_wrap`，节点标 `budget_exceeded`。
 
+
+---
+
+## 📚 十二、RAG 入库全景：三条数据生产线
+
+> 一句话定位：**纪要 / 上传文档 → `knowledge_documents`；决策 → `decisions` 三表**。共用 `embedding_service`（text-embedding-v3），但存储与检索路径分离。
+>
+> 对照源码：`summary_service` → `knowledge_service`；`decision_graph_service`；`api/knowledge.py`
+
+### 12.1 Mermaid 入库流程图
+
+```mermaid
+flowchart TD
+    MT["会议 Meeting"] --> GRAPH["meeting_graph_v2"]
+
+    GRAPH --> SA["summary_agent<br/>纪要文本"]
+    GRAPH --> DE["decision_extractor"]
+    DE --> DD["DecisionDetector<br/>找准拍板段"]
+    DD --> OE["OptionExtractor<br/>抽结构化决策"]
+
+    SA --> SS["SummaryService<br/>落库 summaries"]
+    SS --> KS["KnowledgeService<br/>.index_meeting_summary"]
+
+    OE --> DGS["DecisionGraphService<br/>.save_decisions"]
+
+    subgraph DOC["用户上传文档"]
+        UP["POST /knowledge/upload"] --> PAR["DocumentParser<br/>PDF / Word / TXT"]
+        PAR --> KS2["KnowledgeService<br/>.index_document_file"]
+    end
+
+    subgraph KB["知识库入库 · 共用管道"]
+        KS --> CH1["DocumentChunker<br/>1000字 / overlap 200"]
+        KS2 --> CH2["DocumentChunker"]
+        CH1 --> EMB1["EmbeddingService<br/>.embed_batch"]
+        CH2 --> EMB2["EmbeddingService<br/>.embed_batch"]
+        EMB1 --> KD["knowledge_documents<br/>source_type:<br/>meeting_summary / uploaded_doc"]
+        EMB2 --> KD
+    end
+
+    subgraph DG["决策库入库 · 独立三表"]
+        DGS --> EMB3["EmbeddingService<br/>.embed_text<br/>title + context"]
+        EMB3 --> D1["decisions · 含 embedding"]
+        DGS --> D2["decision_options"]
+        EMB3 --> D3["decision_relations<br/>top-3 相似 · 双向"]
+    end
+
+    classDef meeting fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef agent fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef svc fill:#fff8e1,stroke:#f9a825,color:#000
+    classDef pipe fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    classDef db fill:#fce4ec,stroke:#c62828,color:#000
+
+    class MT,GRAPH meeting
+    class SA,DE,DD,OE agent
+    class SS,KS,KS2,DGS,PAR,UP svc
+    class CH1,CH2,EMB1,EMB2,EMB3 pipe
+    class KD,D1,D2,D3 db
+```
+
+### 12.2 三条线速查
+
+| 来源 | 触发 | 入库表 | 备注 |
+|---|---|---|---|
+| Agent 纪要 | 纪要生成成功后 `index_meeting_summary` | `knowledge_documents` | 先删旧 chunk 再重建 |
+| 用户上传 | `POST /knowledge/upload` | `knowledge_documents` | Parser → 同名覆盖 |
+| Agent 决策 | `save_decisions` | `decisions` + `options` + `relations` | 不进 `knowledge_documents` |
+
+---
+
+## 💬 十三、RAG AI 对话全景：双路召回 + 流式回答
+
+> 一句话定位：**Query Rewrite → 知识库 + 决策库双路检索 → Chat RRF 融合 → LLM 流式生成 → SSE 推前端**。
+>
+> 对照源码：`api/chat.py` → `chat_service.py` → `knowledge_service.search` + `decision_graph_service.search`
+
+### 13.1 Mermaid 对话流程图
+
+```mermaid
+flowchart TD
+    U0["用户创建 ChatSession<br/>POST /chat/sessions"] --> U1["用户提问<br/>例：为什么选择 Redis？"]
+
+    U1 --> API["POST /chat/sessions/{id}/stream"]
+    API --> CS["ChatService.chat_stream()"]
+
+    CS --> SAVE["保存 user message"]
+    SAVE --> HIST["取最近 10 条历史"]
+    HIST --> RW{"Query Rewrite<br/>指代消解?"}
+    RW -->|有指代词 & 历史>1| RQ["改写后 query"]
+    RW -->|否| RQ2["原 query"]
+    RQ --> Q["检索 query"]
+    RQ2 --> Q
+
+    Q --> KS1
+    Q --> DS1
+
+    subgraph KSearch["KnowledgeService.search · top_k=3"]
+        KS1["query 向量化"] --> KV["向量检索 pgvector"]
+        KS1 --> KF["全文检索 ts_rank"]
+        KV --> KRRF["Knowledge RRF 融合"]
+        KF --> KRRF
+        KRRF --> KR["Rerank 关键词"]
+        KR --> KD["去重 overlap 块"]
+    end
+
+    subgraph DSearch["DecisionGraphService.search · top_k=3"]
+        DS1["query 向量化"] --> DV["决策向量检索<br/>decisions.embedding"]
+    end
+
+    KD --> FUSE
+    DV --> FUSE["ChatService._rrf_fuse<br/>跨知识/决策统一排序 · top_k=5"]
+
+    FUSE --> CTX["拼装 Top RAG Context<br/>区分会议纪要 / 文档 / 决策"]
+    CTX --> PROMPT["System Prompt + Context<br/>+ History + Question"]
+    PROMPT --> LLM["LLM stream=True<br/>qwen-plus / qwen-vl-plus"]
+
+    LLM --> SSE["FastAPI SSE<br/>type: token / done"]
+    SSE --> FE["React fetch ReadableStream<br/>useStreamChat"]
+    FE --> UI["页面逐 token 显示"]
+    UI --> ASST["保存 assistant message<br/>metadata.sources"]
+    ASST --> NEXT["下一轮对话"]
+
+    classDef user fill:#e3f2fd,stroke:#1565c0,color:#000
+    classDef svc fill:#fff8e1,stroke:#f9a825,color:#000
+    classDef rag fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef llm fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    classDef fe fill:#fce4ec,stroke:#c62828,color:#000
+
+    class U0,U1,UI,NEXT user
+    class API,CS,SAVE,HIST,RW,RQ,RQ2,Q,FUSE,CTX,PROMPT,ASST svc
+    class KS1,KV,KF,KRRF,KR,KD,DS1,DV rag
+    class LLM,SSE llm
+    class FE fe
+```
+
+### 13.2 检索两层 RRF（别混淆）
+
+| 层级 | 在哪 | 融合什么 |
+|---|---|---|
+| Knowledge RRF | `knowledge_service.search` | 向量检索 + 全文检索 → Rerank → 去重 |
+| Chat RRF | `chat_service._rrf_fuse` | 知识库 top-3 + 决策库 top-3 → 统一 top-5 |
+
+### 13.3 记三条就够
+
+1. **决策不进知识库表**，对话时走 `DecisionGraphService.search` 独立召回。
+2. **Query Rewrite 有门槛**：历史 > 1 且含指代词、query ≤ 50 字才触发。
+3. **sources 随 assistant 消息落库**，前端刷新后可回看引用来源。
+
