@@ -1167,3 +1167,388 @@ flowchart TD
 2. **Query Rewrite 有门槛**：历史 > 1 且含指代词、query ≤ 50 字才触发。
 3. **sources 随 assistant 消息落库**，前端刷新后可回看引用来源。
 
+---
+
+## 🌐 十四、总体时序图：前端 · 后端 · DB · Redis · RAG · LLM 全链路
+
+> 一句话定位：**一图看穿两条主要用户路径**——「A · 生成会议纪要」和「B · RAG AI 对话」。
+> 前端 fetch → FastAPI → Service 分派 → LangGraph 编排 / 双路检索 → PostgreSQL(+pgvector) 落库 → 通义千问 LLM。
+>
+> **关于 Redis**：`docker-compose.yml` 起了 `redis:7-alpine`，`config.py` 也读了 `REDIS_URL`，但主链路（纪要生成 + 对话）**目前都没有走 Redis**。曾经的实时广播实现（`_archived/realtime_broadcaster.py`）注释里写得很直白："**采用内存直连广播而非 Redis Stream pub/sub，简化 MVP 部署依赖**"。因此下图把 Redis 单独画出来，标注为「预留 · 未接入主链路」，避免误导。
+
+### 14.1 端到端 Sequence Mermaid 图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 👤 用户
+    participant FE as ⚛️ React 前端<br/>summary / chat page
+    participant API as 🚏 FastAPI Router<br/>api/*.py
+    participant SS as 🧑‍🍳 SummaryService
+    participant CS as 💬 ChatService
+    participant Graph as 🕸️ meeting_graph_v2<br/>(LangGraph + Harness)
+    participant ARS as 📒 AgentRunService
+    participant KS as 📚 KnowledgeService
+    participant DGS as 🎯 DecisionGraphService
+    participant ES as 🧮 EmbeddingService<br/>text-embedding-v3
+    participant LLM as 🤖 通义千问<br/>qwen-plus / vl-plus
+    participant DB as 🐘 PostgreSQL<br/>+ pgvector
+    participant Redis as 🔴 Redis<br/>(预留 · 未接入主链路)
+
+    Note over U,Redis: 说明 · Redis 已在 docker-compose 起，主链路暂未消费。<br/>实时广播（archived）曾走内存直连，非 Redis Stream。
+
+    rect rgb(227, 242, 253)
+    Note over U,LLM: A · 生成会议纪要 —— POST /meetings/{id}/summarize
+
+    U ->> FE: 点击「生成纪要」
+    FE ->> API: POST /meetings/{id}/summarize
+    API ->> SS: summary_service.generate_summary(db, id)
+
+    SS ->> DB: SELECT Meeting + Transcript
+    DB -->> SS: transcript_text（拼说话人）
+    SS ->> DB: DELETE 旧 Summary / ActionItem / Risk
+    SS ->> DB: INSERT Summary(status=generating)
+    SS ->> ARS: create_run + start_run
+    ARS ->> DB: INSERT AgentRun(status=running)
+    SS ->> SS: new BudgetGuard(50k tokens / ¥0.5)<br/>set_harness_context(run_id, budget)
+
+    SS ->> Graph: meeting_graph_v2.ainvoke(initial_state)
+    Note over Graph,LLM: 图内 Planner → BudgetCheck → 四路 Agent 并行<br/>→ OutputValidator（可回灌）→ HumanReview → Persist<br/>细节见「十五、V2 Harness 编排时序图」
+    Graph ->> LLM: 各节点通过 harness_wrap 调用 LLM
+    LLM -->> Graph: 摘要 / 行动项 / 风险 / 决策 JSON
+    Graph ->> ARS: record_step_start / end + update_budget
+    ARS ->> DB: UPDATE AgentRun.steps / total_tokens / node_usage
+    Graph -->> SS: final_state<br/>{summary, key_points, action_items, risks, decisions, paused?, errors}
+
+    alt paused=True（Planner 标记敏感 / 高风险）
+        SS ->> DB: UPDATE Summary.status=paused
+        SS -->> API: Summary(paused)
+        Note over FE,API: 前端引导审核员到<br/>POST /agent-runs/{run_id}/review
+    else errors 非空
+        SS ->> ARS: finish_run(failed)
+        SS ->> DB: UPDATE Summary.status=failed<br/>+ 保留部分 action_items / risks
+    else 全部成功
+        SS ->> DB: UPDATE Summary + INSERT action_items / risks
+        opt decisions 非空
+            SS ->> DGS: save_decisions(db, meeting_id, decisions)
+            DGS ->> ES: embed_text(title + context)
+            ES ->> LLM: text-embedding-v3
+            LLM -->> ES: 1024 维向量
+            DGS ->> DB: INSERT decisions + decision_options
+            DGS ->> DB: 向量检索 top-3 相似决策 (pgvector cosine)
+            DGS ->> DB: INSERT decision_relations (双向 relates)
+        end
+        SS ->> ARS: finish_run(succeeded)
+        SS ->> KS: index_meeting_summary(meeting_id, summary)
+        KS ->> KS: DocumentChunker (1000 字 / overlap 200)
+        KS ->> ES: embed_batch(chunks)
+        ES ->> LLM: text-embedding-v3
+        LLM -->> ES: 向量列表
+        KS ->> DB: DELETE 旧 chunk<br/>INSERT knowledge_documents（含 embedding）
+    end
+
+    SS -->> API: Summary (completed / paused / failed)
+    API -->> FE: SummaryResponse (JSON)
+    FE ->> FE: React Query 失效并刷新纪要页
+    end
+
+    rect rgb(232, 245, 233)
+    Note over U,LLM: B · RAG AI 对话 —— POST /chat/sessions/{id}/stream (SSE)
+
+    U ->> FE: 创建会话 + 发送提问（可含图片 base64）
+    FE ->> API: POST /chat/sessions
+    API ->> CS: create_session(...)
+    CS ->> DB: INSERT chat_sessions
+    CS -->> FE: {session_id}
+
+    FE ->> API: POST /chat/sessions/{id}/stream<br/>fetch ReadableStream
+    API ->> CS: chat_service.chat_stream(query, images)
+    CS ->> DB: INSERT ChatMessage(role=user)
+    CS ->> DB: SELECT 最近 10 条历史
+
+    opt 历史 > 1 且 query ≤ 50 字 且含指代词
+        CS ->> LLM: Query Rewrite (qwen-plus, temperature=0)
+        LLM -->> CS: 改写后独立 query
+    end
+
+    par 双路 RAG 并行检索
+        CS ->> KS: search(rewritten, top_k=3)
+        KS ->> ES: embed_text(query)
+        ES ->> LLM: text-embedding-v3
+        LLM -->> ES: query 向量
+        KS ->> DB: 向量检索（pgvector cosine_distance）
+        KS ->> DB: 全文检索（ts_rank / plainto_tsquery）
+        KS ->> KS: Knowledge RRF + Rerank + 去重
+        KS -->> CS: doc top-3
+    and
+        CS ->> DGS: search(rewritten, top_k=3)
+        DGS ->> ES: embed_text(query)
+        ES ->> LLM: text-embedding-v3
+        LLM -->> DGS: query 向量
+        DGS ->> DB: decisions 向量检索
+        DGS -->> CS: decision top-3
+    end
+
+    CS ->> CS: Chat RRF 融合 → top-5<br/>拼装 SYSTEM_PROMPT + Context + History + Question
+    Note right of CS: 有图片时切换 qwen-vl-plus，<br/>把 image_url 塞进 user content
+    CS ->> LLM: chat.completions.create(stream=True)
+
+    loop 流式生成（逐 token）
+        LLM -->> CS: delta token
+        CS -->> API: yield delta
+        API -->> FE: SSE data: {type:"token", content}
+        FE ->> FE: setStreamingContent(fullBuffer)
+    end
+
+    LLM -->> CS: 流结束
+    CS ->> DB: INSERT ChatMessage(role=assistant,<br/>metadata.sources=融合结果引用)
+    API -->> FE: SSE data: {type:"done"}
+    FE ->> U: 展示完整回答 + 引用来源徽标
+    end
+```
+
+### 14.2 三条链路速查
+
+| 阶段 | 主要参与者 | 关键库表 | 是否走 LLM |
+|---|---|---|---|
+| 生成纪要图内 | `meeting_graph_v2` + `harness_wrap` | `agent_runs.steps / tokens` | ✅ 每个 Agent 各一次 |
+| 落库（纪要成功后） | `SummaryService` / `DecisionGraphService` / `KnowledgeService` | `summaries` / `action_items` / `risks` / `decisions` / `decision_options` / `decision_relations` / `knowledge_documents` | ✅ 仅 embedding |
+| RAG 对话 | `ChatService` + `KnowledgeService` + `DecisionGraphService` | `chat_sessions` / `chat_messages` / `knowledge_documents` / `decisions` | ✅ Rewrite（可选）+ Embedding + 流式生成 |
+
+### 14.3 一定要记住的三件事
+
+1. **Redis 目前只是"docker-compose 里挂着的一份保险"**——主链路不消费。真要上多实例广播，才需要重新拉起 `_archived/realtime_broadcaster.py` 里的 Redis Stream 方案。
+2. **图内 `persist` 只做"打标"**——真正写业务表在 `SummaryService` 拿到 `final_state` 之后，决策与知识库索引都属于"图后处理"。
+3. **对话是"两路召回 + 两次 RRF"**：`KnowledgeService.search` 里做过一次向量 vs 全文的 RRF；`ChatService._rrf_fuse` 又做了一次知识库 vs 决策库的 RRF——两层别混淆。
+
+---
+
+## 🧬 十五、V2 Harness 多 Agent 编排时序图（补充详图）
+
+> 一句话定位：**把「十四」里"Graph 内部这一大团"拆开看**——`planner → budget_check → route → 4×harness_wrap 并行 → output_validator（可回灌）→ human_review → persist`，把 `contextvar` / `CircuitBreaker` / `BudgetGuard` / `Pydantic Validator` / `AgentRun step 记账` 五件套的先后顺序钉死。
+>
+> 对照源码：`agents/meeting_graph_v2.py` + `agents/harness/wrap.py` + `agents/harness/{budget,circuit_breaker,validator,retry}.py` + `agents/nodes/*.py`
+
+### 15.1 完整 Sequence Mermaid 图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SS as 🧑‍🍳 SummaryService
+    participant Graph as 🕸️ meeting_graph_v2<br/>StateGraph
+    participant CV as 🧵 contextvar<br/>run_id + budget
+    participant Planner as 🧠 planner_node
+    participant Budget as 💰 budget_check_node
+    participant Route as 🚦 route_after_<br/>budget_check
+    participant Wrap as 🏭 harness_wrap<br/>装饰器
+    participant CB as 🔌 CircuitBreaker<br/>llm_breaker
+    participant Agent as 🤖 Agent 原函数<br/>summary/action/risks/decision
+    participant BG as 🧾 BudgetGuard
+    participant Val as 🧪 validator.<br/>validate_agent_output
+    participant OV as 🕵️ output_validator_node
+    participant HR as 👤 human_review_node
+    participant Persist as 💾 persist_node
+    participant ARS as 📒 AgentRunService
+    participant DB as 🐘 PostgreSQL
+    participant LLM as 🤖 通义千问
+
+    SS ->> ARS: create_run + start_run
+    ARS ->> DB: INSERT AgentRun(status=running)
+    SS ->> CV: set_harness_context(run_id, BudgetGuard)
+    SS ->> Graph: ainvoke(initial_state)
+
+    Note over Graph,LLM: ── ① Planner 规划 ──
+    Graph ->> Planner: planner_node(state)
+    Planner ->> LLM: PLANNER_PROMPT + 转写前 2000 字
+    alt LLM 成功且 JSON 合法
+        LLM -->> Planner: {meeting_type, should_run_*, needs_human_review, ...}
+    else 失败 / 解析失败 / 异常
+        Planner ->> Planner: _build_fallback_plan()（按标题关键词兜底）
+    end
+    Planner ->> ARS: save_plan(run_id, plan)
+    ARS ->> DB: UPDATE AgentRun.plan
+    Planner -->> Graph: {plan: {...}}
+
+    Note over Graph,LLM: ── ② Budget Check 预算 + 长文压缩 ──
+    Graph ->> Budget: budget_check_node(state)
+    alt strategy=compressed 且 len > 20k
+        Budget ->> LLM: COMPRESS_PROMPT + 全文
+        LLM -->> Budget: 地图式摘要（≤30%）
+        Budget -->> Graph: {transcript_compressed_text, compressed=True}
+    else
+        Budget -->> Graph: {compressed=False}
+    end
+
+    Note over Graph: ── ③ 动态 fan-out（按 plan.should_run_*）──
+    Graph ->> Route: route_after_budget_check(state)
+    Route -->> Graph: ["summary_agent", "action_items_agent",<br/>"risks_agent", "decision_extractor"]
+
+    par 并行 · 每路独立走 Harness 七步
+        Graph ->> Wrap: summary_agent_harnessed(state)
+
+        Note over Wrap,ARS: 【Harness 七步 · 见 15.2】
+        Wrap ->> CV: 读取 run_id / budget
+        Wrap ->> ARS: ① record_step_start(node)
+        ARS ->> DB: AgentRun.steps.append({running})
+
+        Wrap ->> CB: ② llm_breaker.allow()?
+        alt state=OPEN 且未到 recovery_timeout
+            CB -->> Wrap: False
+            Wrap ->> ARS: record_step_end(status=skipped)
+            Wrap -->> Graph: {errors:["熔断中..."]}
+        else 放行（CLOSED / HALF_OPEN）
+            CB -->> Wrap: True
+            Wrap ->> Agent: ③ asyncio.wait_for(agent(state), timeout=60s)
+
+            Agent ->> LLM: SUMMARY / ACTION / RISKS Prompt + transcript
+            LLM -->> Agent: markdown / JSON + usage_metadata
+            Agent ->> BG: _try_consume_budget(tokens_in, tokens_out)
+            BG ->> BG: cost = tokens × 模型定价
+            alt used_tokens > max_tokens 或 used_cost > max_cost
+                BG -->> Agent: raise BudgetExceededError
+                Note right of Agent: 异常上抛到 wrap
+            else 未超限
+                BG ->> DB: UPDATE AgentRun.total_tokens / node_usage
+                BG -->> Agent: 记账完成
+            end
+            Agent -->> Wrap: result = {summary / action_items / risks / decisions}
+
+            alt ④ 抛 TimeoutError
+                Wrap ->> CB: record_failure()
+                Wrap ->> ARS: record_step_end(status=timeout)
+                Wrap -->> Graph: {errors:["节点 xxx 超时"]}
+            else 抛 BudgetExceededError
+                Wrap ->> ARS: record_step_end(status=budget_exceeded)
+                Wrap -->> Graph: {errors:[...], budget_exceeded:True}
+            else 抛其他 Exception
+                Wrap ->> CB: record_failure()（连续 5 次→OPEN）
+                Wrap ->> ARS: record_step_end(status=failed)
+                Wrap -->> Graph: {errors:["执行失败..."]}
+            else ✅ 成功
+                Wrap ->> CB: record_success()（HALF_OPEN→CLOSED / 计数清零）
+
+                opt ⑤ validate_output=True
+                    Wrap ->> Val: validate_agent_output(node, raw)
+                    alt Pydantic 通过
+                        Val -->> Wrap: (True, cleaned)
+                        Wrap ->> Wrap: result[field] = cleaned
+                    else 结构 / 长度 / 枚举校验失败
+                        Val -->> Wrap: (False, msg)
+                        Wrap ->> ARS: record_step_end(status=invalid_output)
+                        Wrap -->> Graph: {errors:[...], validation_failed:True}
+                    end
+                end
+
+                Wrap ->> ARS: ⑥ update_budget(tokens, cost, node_usage)
+                ARS ->> DB: UPDATE AgentRun.total_tokens / node_usage
+                Wrap ->> ARS: ⑦ record_step_end(status=succeeded, duration_ms)
+                ARS ->> DB: 定稿 step 记录
+                Wrap -->> Graph: {summary / action_items / risks / decisions}
+            end
+        end
+    and
+        Graph ->> Wrap: action_items_agent_harnessed
+        Note right of Wrap: 同 Harness 七步<br/>产出 action_items[]
+    and
+        Graph ->> Wrap: risks_agent_harnessed
+        Note right of Wrap: 同 Harness 七步<br/>产出 risks[]
+    and
+        Graph ->> Wrap: decision_extractor_harnessed
+        Note right of Wrap: 两步流水线<br/>Step1 detect_decisions<br/>Step2 extract_options<br/>Pydantic 内部校验，<br/>validate_output=False
+    end
+
+    Note over Graph,DB: ── ④ Output Validator 批改作业（不校验 decisions）──
+    Graph ->> OV: output_validator_node(state)
+    loop 遍历 summary_agent / action_items_agent / risks_agent
+        OV ->> Val: validate_agent_output(node, raw)
+        alt ✅ 通过
+            Val -->> OV: (True, cleaned)
+            OV ->> OV: cleaned_updates[field] = cleaned
+        else ❌ 校验失败 且 retry_count < 2
+            OV ->> OV: retry_count += 1
+            OV -->> Graph: {valid:False,<br/>retry_node:"risks_agent",<br/>retry_reason:"severity 非法",<br/>risks_agent_retry: N+1}
+        else 💥 重试耗尽（=2）
+            OV -->> Graph: {valid:False,<br/>errors:["重试耗尽"],<br/>retry_node:None}
+        end
+    end
+    opt 全部通过
+        OV -->> Graph: {valid:True, retry_node:None, ...cleaned_updates}
+    end
+
+    Note over Graph: ── ⑤ Router · 分派后续走向 ──
+    Graph ->> Graph: route_after_validator(state)
+    alt paused=True（human_review 前置暂停）
+        Graph -->> SS: 直达 END（工作流暂停等审批）
+    else retry_node 非空
+        Graph ->> Wrap: 回灌到 retry_node<br/>(最多重跑 2 次，走完整 Harness 七步)
+        Note over Wrap,Agent: 计数字段 xxx_retry 已 +1
+    else valid=True 或 重试耗尽
+        Graph ->> HR: human_review_node(state)
+        Note over HR: MVP 阶段：直接放行<br/>{approved:True, review_status:"approved"}
+        HR -->> Graph: {approved:True}
+    end
+
+    alt approved=True
+        Graph ->> Persist: persist_node(state)
+        Persist -->> Graph: {persisted:True}
+    else 拒绝 / 未通过
+        Graph -->> SS: END
+    end
+
+    Graph -->> SS: final_state
+
+    Note over SS,DB: ── ⑥ 图后处理：SummaryService 真正落库 ──
+    alt paused
+        SS ->> DB: UPDATE Summary.status=paused
+    else errors
+        SS ->> ARS: finish_run(failed)
+        SS ->> DB: UPDATE Summary.status=failed + 部分数据兜底
+    else 成功
+        SS ->> DB: UPDATE Summary(content, key_points, status=completed)
+        SS ->> DB: INSERT action_items / risks
+        opt decisions 非空
+            SS ->> DGS: save_decisions（embedding + top-3 relations，失败不回滚）
+        end
+        SS ->> ARS: finish_run(succeeded)
+        SS ->> KS: index_meeting_summary（Chunk + Embed + pgvector）
+    end
+```
+
+### 15.2 Harness 七步在源码里的具体行数
+
+| 步骤 | 做什么 | 关键源码 |
+|---|---|---|
+| ① 开单 | 写 `AgentRun.steps` 一条 `status=running` | `harness/wrap.py:84` `_record_step_start` |
+| ② 熔断 | `llm_breaker.allow()`；OPEN 直接跳过 | `harness/wrap.py:87` + `circuit_breaker.py:49` |
+| ③ 执行 | `asyncio.wait_for(agent(state), timeout=60s)` | `harness/wrap.py:99-102` |
+| ④ 异常分派 | Timeout / BudgetExceeded / 其他 Exception 分三路记账 | `harness/wrap.py:103-120` |
+| ⑤ 校验 | `validate_agent_output(name, raw)` Pydantic 结构校验 | `harness/wrap.py:126-145` + `harness/validator.py` |
+| ⑥ 记账 | `budget.used_tokens / used_cost / node_usage` 同步到 `AgentRun` | `harness/wrap.py:149-162` |
+| ⑦ 关单 | 写 `AgentRun.steps` 补齐 `status=succeeded / duration_ms` | `harness/wrap.py:164` `_record_step_end` |
+
+### 15.3 三处「重试」别混淆
+
+| 层级 | 触发条件 | 上限 | 位置 |
+|---|---|---|---|
+| LLM 请求内智能重试 | 网络 / 429 / 5xx / 超时 | 3 次（指数退避 + 抖动） | `harness/retry.py:with_smart_retry` |
+| **v1** Agent 内旧重试 | 同上 | 3 次 | `meeting_graph.py:_invoke_with_retry` |
+| **工作流回灌重试** | Pydantic 校验失败 | 每 Agent 2 次 | `nodes/output_validator.py:MAX_RETRY_PER_NODE` + `route_after_validator` |
+
+> **口诀：** 智能重试是"电话没接通再打一次"；回灌重试是"作业格式不对回去重写"；这两个层是**独立生效**的——一次 Agent 调用可能内部智能重试 3 次，出结果后仍被工作流 validator 打回再跑 2 次。
+
+### 15.4 一份"节点结束时到底往数据库写了什么"清单
+
+| 出口 | AgentRun.steps.status | state 关键字段 | 后续 |
+|---|---|---|---|
+| ✅ 成功 | `succeeded` | `summary / action_items / ...` | 走 output_validator |
+| ⏭️ 熔断跳过 | `skipped` | `errors: ["熔断中..."]` | validator 无产出可校验 |
+| ⏰ 超时 | `timeout` | `errors: ["超时"]` | breaker.record_failure 累计 |
+| 💸 预算超限 | `budget_exceeded` | `errors, budget_exceeded=True` | 直达图后处理，标 failed |
+| 💥 执行异常 | `failed` | `errors: ["执行失败..."]` | breaker.record_failure 累计 |
+| ❌ 校验不合格 | `invalid_output` | `errors, validation_failed=True` | output_validator 决定是否回灌 |
+
+### 15.5 一句话总览
+
+> **planner 决定跑哪几个 Agent，budget_check 决定拿全文还是压缩版，`harness_wrap` 把每个 Agent 变成"带记账+熔断+超时+重试+校验"的工业件，`output_validator` 是最后一关质检员——不合格就回灌，最多两次；`human_review` 在 MVP 直接放行，`persist` 只打完事标记，真正落库在 `SummaryService` 手上，决策 + 知识库索引都是"图后处理"。**
+
+
