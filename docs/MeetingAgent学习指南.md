@@ -367,37 +367,6 @@ api/meetings.ts
 - 搜索关键词，观察结果。
 - 找到搜索同时使用“向量检索”和“全文检索”的代码。
 
-### Day 11：RAG 对话
-
-目标：理解 AI 对话不是裸 LLM，而是检索增强。
-
-读：
-
-- `backend/app/services/chat_service.py`
-- `backend/app/api/chat.py`
-- `frontend/src/api/chat.ts`
-- `frontend/src/features/chat/hooks/use-chat.ts`
-- `frontend/src/features/chat/pages/chat-page.tsx`
-
-练习：
-
-- 追踪 `streamChat()` 从前端发送到后端 SSE 返回。
-- 找出 `doc_results` 和 `decision_results` 是在哪里融合的。
-- 理解系统提示词 `SYSTEM_PROMPT` 如何使用检索结果。
-
-
-
-### Day 14：做一个小改动
-
-目标：通过改代码巩固理解。不要一上来改 Agent prompt 或数据库结构，先从前端展示和普通 API 字段开始。
-
-推荐小任务：
-
-- 给会议详情页增加一个“转写模式”的更明显展示。
-- 给决策列表增加一个 confidence 筛选。
-- 给知识库搜索结果展示 source_type。
-- 给 AgentRun 列表增加失败原因摘要。
-
 ## 10. 必读文件清单
 
 ### 第三优先级
